@@ -1,0 +1,188 @@
+extern "C"
+{
+#include "libavformat/avformat.h"
+#include "libavutil/imgutils.h"
+}
+
+int main()
+{
+    AVFormatContext *fmtCtx = NULL;
+    AVOutputFormat *outFmt = NULL;
+    AVStream *vStream = NULL;
+    AVCodecContext *codecCtx = NULL;
+    AVCodec *codec = NULL;
+    AVPacket *pkt = av_packet_alloc();
+
+    uint8_t *picture_buf = NULL;
+    AVFrame *picFrame = NULL;
+    size_t size;
+    int ret = -1;
+
+    char outFile[] = "/root/study_c/.temp/result.h264";
+    FILE *in_file = fopen("/root/study_c/.temp/yuv420p_352x288.yuv", "rb");
+    if (!in_file)
+    {
+        printf("can not open file");
+        return -1;
+    }
+
+    do
+    {
+        //[2]!打开输出文件，并填充fmtCtx数据
+        int in_w = 352, in_h = 288, frameCnt = 99999;
+        if (avformat_alloc_output_context2(&fmtCtx, NULL, NULL, outFile) < 0)
+        {
+            printf("Cannot alloc output file context.\n");
+            break;
+        }
+
+        outFmt = fmtCtx->oformat;
+        // outFmt->video_codec = AV_CODEC_ID_H265;
+        //[2]!
+
+        //[3]!打开输出文件
+        if (avio_open(&fmtCtx->pb, outFile, AVIO_FLAG_READ_WRITE) < 0)
+        {
+            printf("output file open failed.\n");
+            break;
+        }
+        //[3]!
+
+        //[4]!创建h264视频流，并设置参数
+        vStream = avformat_new_stream(fmtCtx, codec);
+        if (vStream == NULL)
+        {
+            printf("failed create new video stream.\n");
+            break;
+        }
+        vStream->time_base.den = 25;
+        vStream->time_base.num = 1;
+        //[4]!
+
+        //[5]!编码参数相关
+        AVCodecParameters *codecPara = vStream->codecpar;
+        codecPara->codec_id = outFmt->video_codec;
+        codecPara->codec_type = AVMEDIA_TYPE_VIDEO;
+        codecPara->width = in_w;
+        codecPara->height = in_h;
+        codecPara->format = AV_PIX_FMT_YUV420P;
+        //[5]!
+
+        //[6]!查找编码器
+        codec = avcodec_find_encoder(outFmt->video_codec);
+        if (codec == NULL)
+        {
+            printf("Cannot find any endcoder.\n");
+            break;
+        }
+        //[6]!
+
+        //[7]!设置编码器内容
+        codecCtx = avcodec_alloc_context3(codec);
+        avcodec_parameters_to_context(codecCtx, codecPara);
+        if (codecCtx == NULL)
+        {
+            printf("Cannot alloc context.\n");
+            break;
+        }
+
+        // codecCtx->codec_id = outFmt->video_codec;
+        // codecCtx->codec_type = AVMEDIA_TYPE_VIDEO;
+        // codecCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+        // codecCtx->width = in_w;
+        // codecCtx->height = in_h;
+        codecCtx->time_base.num = 1;
+        codecCtx->time_base.den = 25;
+        codecCtx->bit_rate = 400000;
+        codecCtx->gop_size = 12;
+
+        if (codecCtx->codec_id == AV_CODEC_ID_H264)
+        {
+            codecCtx->qmin = 10;
+            codecCtx->qmax = 51;
+            codecCtx->qcompress = (float)0.6;
+        }
+        if (codecCtx->codec_id == AV_CODEC_ID_MPEG2VIDEO)
+            codecCtx->max_b_frames = 2;
+        if (codecCtx->codec_id == AV_CODEC_ID_MPEG1VIDEO)
+            codecCtx->mb_decision = 2;
+        //[7]!
+
+        //[8]!打开编码器
+        if (avcodec_open2(codecCtx, codec, NULL) < 0)
+        {
+            printf("Open encoder failed.\n");
+            break;
+        }
+        //[8]!
+
+        av_dump_format(fmtCtx, 0, outFile, 1); //输出 输出文件流信息
+
+        //初始化帧
+        picFrame = av_frame_alloc();
+        picFrame->width = codecCtx->width;
+        picFrame->height = codecCtx->height;
+        picFrame->format = codecCtx->pix_fmt;
+        size = (size_t)av_image_get_buffer_size(codecCtx->pix_fmt, codecCtx->width, codecCtx->height, 1);
+        picture_buf = (uint8_t *)av_malloc(size);
+        av_image_fill_arrays(picFrame->data, picFrame->linesize,
+                             picture_buf, codecCtx->pix_fmt,
+                             codecCtx->width, codecCtx->height, 1);
+
+        //[9] --写头文件
+        ret = avformat_write_header(fmtCtx, NULL);
+        //[9]
+
+        int y_size = codecCtx->width * codecCtx->height;
+        av_new_packet(pkt, (int)(size * 3));
+
+        //[10] --循环编码每一帧
+        for (int i = 0; i < frameCnt; i++)
+        {
+            //读入YUV
+            if (feof(in_file))
+                break;
+            if (fread(picture_buf, 1, (unsigned long)(y_size * 3 / 2), in_file) <= 0)
+            {
+                printf("read file fail!\n");
+                break;
+                return -1;
+            }
+
+            picFrame->data[0] = picture_buf;                  //亮度Y
+            picFrame->data[1] = picture_buf + y_size;         // U
+            picFrame->data[2] = picture_buf + y_size * 5 / 4; // V
+            // AVFrame PTS
+            picFrame->pts = i;
+
+            //编码
+            if (avcodec_send_frame(codecCtx, picFrame) >= 0)
+            {
+                while (avcodec_receive_packet(codecCtx, pkt) >= 0)
+                {
+                    printf("encoder success %d!\n", i);
+
+                    // parpare packet for muxing
+                    pkt->stream_index = vStream->index;
+                    av_packet_rescale_ts(pkt, codecCtx->time_base, vStream->time_base);
+                    pkt->pos = -1;
+                    ret = av_interleaved_write_frame(fmtCtx, pkt);
+                    if (ret < 0)
+                    {
+                        printf("error in frame");
+                        // printf("error is: %s.\n", av_err2str(ret));
+                    }
+                    av_packet_unref(pkt); //刷新缓存
+                }
+            }
+        }
+        //[10]
+    } while (0);
+
+    if (pkt != NULL)
+    {
+        av_packet_free(&pkt);
+    }
+    fclose(in_file);
+    return 0;
+}

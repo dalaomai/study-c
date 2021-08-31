@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.0.0)
+project(mp32pcm)
+
+set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR})
+
+add_executable(mp32pcm main.cpp)
+target_link_libraries(mp32pcm avformat avutil avcodec)

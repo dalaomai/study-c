@@ -119,7 +119,7 @@ int main()
                 printf("frame_index:%d\n", frame_index);
                 if (pkt->pts == AV_NOPTS_VALUE)
                 {
-                    printf("frame_index:%d not found pts\n", frame_index);
+                    // printf("frame_index:%d not found pts\n", frame_index);
                     AVRational time_base1 = inStream->time_base;
                     // int64_t calc_duration = (double)AV_TIME_BASE / av_q2d(inStream->r_frame_rate);
                     // pkt->pts = (double)(frame_index * calc_duration) / (double)(av_q2d(time_base1) * AV_TIME_BASE);

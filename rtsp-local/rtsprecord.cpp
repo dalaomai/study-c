@@ -1,22 +1,402 @@
 #include "rtsprecord.h"
 
+av_always_inline char *av_err2str_inline(int errnum)
+{
+    static char str[AV_ERROR_MAX_STRING_SIZE];
+    memset(str, 0, sizeof(str));
+    return av_make_error_string(str, AV_ERROR_MAX_STRING_SIZE, errnum);
+}
+
+int check(int ret)
+{
+    if (ret < 0 && ret != -11)
+    {
+        fprintf(stderr, "err:%s\n", av_err2str_inline(ret));
+    }
+    return ret;
+}
+
+StreamCodecContext::StreamCodecContext() {}
+
+StreamCodecContext::~StreamCodecContext()
+{
+    if (dec_ctx != NULL)
+    {
+        avcodec_free_context(dec_ctx);
+    }
+    if (enc_ctx != NULL)
+    {
+        avcodec_free_context(enc_ctx);
+    }
+    if (dec_frame != NULL)
+    {
+        av_frame_free(dec_frame);
+    }
+    if (enc_frame != NULL)
+    {
+        av_frame_free(enc_frame);
+    }
+}
+
+int StreamCodecContext::init_decodec(AVFormatContext *in_fmt_ctx, AVStream *in_stream)
+{
+    StreamCodecContext::in_stream = in_stream;
+    AVCodec *decodec = avcodec_find_decoder(in_stream->codecpar->codec_id);
+    dec_ctx = avcodec_alloc_context3(decodec);
+    avcodec_parameters_to_context(dec_ctx, in_stream->codecpar);
+
+    if (dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO)
+    {
+        dec_ctx->framerate = av_guess_frame_rate(in_fmt_ctx, in_stream, NULL);
+    }
+
+    avcodec_open2(dec_ctx, decodec, NULL);
+    return 0;
+}
+
+int StreamCodecContext::init_encodec(AVFormatContext *out_fmt_ctx, AVStream *out_stream)
+{
+    StreamCodecContext::out_stream = out_stream;
+}
+
+VideoStreamCodecContext::VideoStreamCodecContext(bool allow_copy)
+{
+    VideoStreamCodecContext::allow_copy = allow_copy;
+}
+
+VideoStreamCodecContext::~VideoStreamCodecContext() {}
+
+int VideoStreamCodecContext::init_decodec(AVFormatContext *in_fmt_ctx, AVStream *in_stream)
+{
+    StreamCodecContext::init_decodec(in_fmt_ctx, in_stream);
+
+    input_pkt_duration = 1 / (av_q2d(in_stream->avg_frame_rate) * av_q2d(in_stream->time_base));
+
+    if (allow_copy && dec_ctx->codec_id == videoEncoderID)
+    {
+        is_copy = true;
+    }
+
+    // outVStream->time_base = vDecoderCtx->time_base;
+    return 1;
+}
+
+int VideoStreamCodecContext::init_encodec(AVFormatContext *out_fmt_ctx, AVStream *out_stream)
+{
+    StreamCodecContext::init_encodec(out_fmt_ctx, out_stream);
+    if (is_copy)
+    {
+        avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
+        out_stream->codecpar->codec_tag = MKTAG('a', 'v', 'c', '1');
+        return 1;
+    }
+    AVCodec *encodec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    enc_ctx = avcodec_alloc_context3(encodec);
+    // avcodec_parameters_to_context(enc_ctx, in_stream->codecpar);
+
+    // enc_ctx->color_range = dec_ctx->color_range;
+    enc_ctx->height = dec_ctx->height;
+    enc_ctx->width = dec_ctx->width;
+    enc_ctx->sample_aspect_ratio = dec_ctx->sample_aspect_ratio;
+    // enc_ctx->codec_tag = MKTAG('a', 'v', 'c', '1');
+    if (encodec->pix_fmts)
+    {
+        enc_ctx->pix_fmt = encodec->pix_fmts[0];
+    }
+    else
+    {
+        enc_ctx->pix_fmt = dec_ctx->pix_fmt;
+    }
+    enc_ctx->time_base = av_inv_q(dec_ctx->framerate);
+
+    enc_ctx->gop_size = 120; /* emit one intra frame every twelve frames at most */
+    enc_ctx->max_b_frames = 16;
+    enc_ctx->rc_buffer_size = 0;
+
+    if (out_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
+    {
+        enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    av_dict_set(&enc_options, "allow_skip_frames", "1", 0);
+    check(avcodec_open2(enc_ctx, encodec, &enc_options));
+
+    avcodec_parameters_from_context(out_stream->codecpar, enc_ctx);
+
+    img_sws_ctx = sws_getContext(
+        dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+        enc_ctx->width, enc_ctx->height, enc_ctx->pix_fmt, SWS_BICUBIC,
+        NULL, NULL, NULL);
+
+    dec_frame = av_frame_alloc();
+    enc_frame = av_frame_alloc();
+
+    dec_frame->width = dec_ctx->width;
+    dec_frame->height = dec_ctx->height;
+    dec_frame->format = video_pix_format;
+    av_image_alloc(enc_frame->data, enc_frame->linesize,
+                   dec_ctx->width, dec_ctx->height, video_pix_format, 1);
+
+    enc_frame->width = enc_ctx->width;
+    enc_frame->height = enc_ctx->height;
+    enc_frame->format = video_pix_format;
+}
+
+int VideoStreamCodecContext::decode_pkt(AVPacket *pkt, PacketQueue *pkt_queue)
+{
+    int ret = -1;
+    if (pkt->duration == 0)
+    {
+        pkt->duration = input_pkt_duration;
+    }
+    if (is_copy)
+    {
+        pkt_queue->push(pkt);
+        return 0;
+    }
+
+    av_packet_rescale_ts(pkt, in_stream->time_base, av_inv_q(dec_ctx->framerate));
+    if (pkt->flags & AV_PKT_FLAG_KEY)
+    {
+        key_pkt_pts = pkt->pts;
+    }
+    else if (pkt->pts < key_pkt_pts)
+    {
+        av_packet_unref(pkt);
+        return 0;
+    }
+    ret = check(avcodec_send_packet(dec_ctx, pkt));
+
+    while (1)
+    {
+        ret = check(avcodec_receive_frame(dec_ctx, dec_frame));
+        if (ret < 0)
+        {
+            if (pkt == NULL)
+            {
+                enc_frame = NULL;
+            }
+            else
+            {
+                break;
+            }
+        }
+        else
+        {
+            check(sws_scale(img_sws_ctx, dec_frame->data, dec_frame->linesize, 0, dec_ctx->height, enc_frame->data, enc_frame->linesize));
+            enc_frame->pkt_duration = dec_frame->pkt_duration;
+            enc_frame->pts = dec_frame->pts;
+            // enc_frame->pkt_dts = dec_frame->pkt_dts;
+            // enc_frame->pkt_pts = dec_frame->pkt_pts;
+            // printf("pts:%d dts:%d %d\n", enc_frame->pts, enc_frame->pkt_dts, enc_frame->pkt_duration);
+            // enc_frame->pkt_pos = inPkt->pos;
+        }
+
+        int enc_frame_pts = 0;
+        if (enc_frame != NULL)
+        {
+            enc_frame_pts = enc_frame->pts;
+        }
+        if (last_enc_frame_pts < 0)
+        {
+            last_enc_frame_pts = enc_frame->pts - enc_frame->pkt_duration;
+        }
+
+        do
+        {
+            if (enc_frame_pts == last_enc_frame_pts)
+            {
+                break;
+            }
+            if (enc_frame != NULL)
+            {
+                last_enc_frame_pts = last_enc_frame_pts + enc_frame->pkt_duration;
+                enc_frame->pts = last_enc_frame_pts;
+            }
+            check(avcodec_send_frame(enc_ctx, enc_frame));
+            // av_frame_unref(enc_frame);
+            while (1)
+            {
+                out_pkt = av_packet_alloc();
+                // av_new_packet(out_pkt,enc_ctx->height*enc_ctx->width);
+
+                ret = check(avcodec_receive_packet(enc_ctx, out_pkt));
+                if (ret >= 0)
+                {
+                    out_pkt->stream_index = out_stream->index;
+                    av_packet_rescale_ts(out_pkt, enc_ctx->time_base, out_stream->time_base);
+                    pkt_queue->push(out_pkt);
+                }
+                else
+                {
+                    av_packet_free(&out_pkt);
+                    break;
+                }
+            }
+        } while (enc_frame != NULL && enc_frame->pts < enc_frame_pts);
+    }
+
+    if (pkt != NULL)
+    {
+        av_packet_free(&pkt);
+    }
+
+    return 0;
+}
+
+AudioStreamCodecContext::AudioStreamCodecContext() {}
+
+AudioStreamCodecContext::~AudioStreamCodecContext() {}
+
+int AudioStreamCodecContext::init_decodec(AVFormatContext *in_fmt_ctx, AVStream *in_stream)
+{
+    int ret = StreamCodecContext::init_decodec(in_fmt_ctx, in_stream);
+
+    // out_stream->time_base = dec_ctx->time_base;
+
+    return ret;
+}
+
+int AudioStreamCodecContext::init_encodec(AVFormatContext *out_fmt_ctx, AVStream *out_stream)
+{
+    StreamCodecContext::init_encodec(out_fmt_ctx, out_stream);
+
+    AVCodec *encoder = avcodec_find_encoder(audioEncoderID);
+
+    enc_ctx = avcodec_alloc_context3(encoder);
+    enc_ctx->channels = in_stream->codecpar->channels;
+    enc_ctx->channel_layout = av_get_default_channel_layout(enc_ctx->channels);
+    enc_ctx->sample_rate = dec_ctx->sample_rate;
+    enc_ctx->sample_fmt = encoder->sample_fmts[0];
+    // enc_ctx->bit_rate = dec_ctx->bit_rate;
+
+    // AVCodecParameters *outCodecPara = outAStream->codecpar;
+    // avcodec_parameters_copy(outCodecPara, inAStream->codecpar);
+    // outCodecPara->codec_id = audioEncoderID;
+    // outCodecPara->channels = inAStream->codecpar->channels;
+    // outCodecPara->channel_layout = av_get_default_channel_layout(outCodecPara->channels);
+    // outCodecPara->format = AV_SAMPLE_FMT_FLTP;
+    // ret = avcodec_parameters_to_context(aEncoderCtx, outCodecPara);
+    // if (ret < 0)
+    // {
+    //     fprintf(stderr, "err audio encoder avcodec_parameters_to_context");
+    //     return ret;
+    // }
+    if (out_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
+    {
+        enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
+    check(avcodec_open2(enc_ctx, encoder, NULL));
+
+    avcodec_parameters_from_context(out_stream->codecpar, enc_ctx);
+
+    int_swr();
+
+    dec_frame = av_frame_alloc();
+    enc_frame = av_frame_alloc();
+
+    dec_frame->channel_layout = av_get_default_channel_layout(dec_ctx->channels);
+    dec_frame->sample_rate = dec_ctx->sample_rate;
+    dec_frame->format = dec_ctx->sample_fmt;
+
+    enc_frame->channel_layout = enc_ctx->channel_layout;
+    enc_frame->sample_rate = enc_ctx->sample_rate;
+    enc_frame->format = enc_ctx->sample_fmt;
+    // enc_frame->nb_samples = enc_ctx->frame_size;
+    return 1;
+}
+
+int AudioStreamCodecContext::int_swr()
+{
+    swr_ctx = swr_alloc_set_opts(
+        NULL,
+        av_get_default_channel_layout(enc_ctx->channels),
+        enc_ctx->sample_fmt,
+        enc_ctx->sample_rate,
+        av_get_default_channel_layout(dec_ctx->channels),
+        dec_ctx->sample_fmt,
+        dec_ctx->sample_rate,
+        0, NULL);
+
+    check(swr_init(swr_ctx));
+
+    smaple_fifo = av_audio_fifo_alloc(enc_ctx->sample_fmt, enc_ctx->channels, 1);
+}
+
+int AudioStreamCodecContext::decode_pkt(AVPacket *pkt, PacketQueue *pkt_queue)
+{
+    int ret = -1;
+
+    av_packet_rescale_ts(pkt, in_stream->time_base, dec_ctx->time_base);
+    check(avcodec_send_packet(dec_ctx, pkt));
+
+    while (check(avcodec_receive_frame(dec_ctx, dec_frame)) >= 0)
+    {
+        uint8_t **converted_input_samples = NULL;
+        // converted_input_samples = (uint8_t **)calloc(enc_ctx->channels, sizeof(*converted_input_samples));
+
+        // check(av_samples_alloc(
+        //     converted_input_samples, NULL, enc_ctx->channels, enc_ctx->frame_size, enc_ctx->sample_fmt, 0));
+        // swr_convert(swr_ctx, converted_input_samples, enc_frame->nb_samples, (const uint8_t **)dec_frame->data, dec_frame->nb_samples);
+
+        // check(av_audio_fifo_realloc(smaple_fifo, av_audio_fifo_size(smaple_fifo) + enc_ctx->frame_size));
+        // av_audio_fifo_write(smaple_fifo, (void **)converted_input_samples, enc_ctx->frame_size);
+
+        dec_frame->channel_layout = av_get_default_channel_layout(dec_ctx->channels);
+        check(swr_convert_frame(swr_ctx, enc_frame, dec_frame));
+        enc_frame->pts = dec_frame->pts;
+        enc_frame->pkt_dts = dec_frame->pkt_dts;
+
+        check(avcodec_send_frame(enc_ctx, enc_frame));
+
+        while (1)
+        {
+            out_pkt = av_packet_alloc();
+
+            ret = check(avcodec_receive_packet(enc_ctx, out_pkt));
+
+            if (ret < 0)
+            {
+                av_packet_free(&out_pkt);
+                break;
+            }
+            else
+            {
+                av_packet_rescale_ts(out_pkt, enc_ctx->time_base, out_stream->time_base);
+                out_pkt->stream_index = out_stream->index;
+                pkt_queue->push(out_pkt);
+            }
+        }
+
+        av_frame_unref(dec_frame);
+    }
+}
+
 RTSPRecord::RTSPRecord(const char *inFileName, const char *outFileName)
 {
     RTSPRecord::inFileName = inFileName;
     RTSPRecord::outFileName = outFileName;
-
     inFmtCtx = avformat_alloc_context();
-    inPkt = av_packet_alloc();
-    // vOutPkt = av_packet_alloc();
-    videoInFrame = av_frame_alloc();
-    audioInFrame = av_frame_alloc();
-    videoMiddleFrame = av_frame_alloc();
-    audioMiddleFrame = av_frame_alloc();
-    // aOutPkt = av_packet_alloc();
+
+    v_input_pkt_queue = new PacketQueue();
+    a_input_pkt_queue = new PacketQueue();
+    video_pkt_queue = new PacketQueue();
+    audio_pkt_queue = new PacketQueue();
+
+    write_pkt_cond = new std::condition_variable();
+    v_pkt_process_cond = new std::condition_variable();
+    a_pkt_process_cond = new std::condition_variable();
 }
 
 RTSPRecord::~RTSPRecord()
 {
+    delete v_input_pkt_queue;
+    delete a_input_pkt_queue;
+    delete video_pkt_queue;
+    delete audio_pkt_queue;
+    delete write_pkt_cond;
+    delete v_pkt_process_cond;
+    delete a_pkt_process_cond;
     return;
 }
 
@@ -33,46 +413,52 @@ int RTSPRecord::start()
     {
         return ret;
     }
-    ret = prepare_video_decoder();
-    if (ret < 0)
-    {
-        return ret;
-    }
-    ret = prepare_video_encoder();
-    if (ret < 0)
-    {
-        return ret;
-    }
-    ret = prepare_audio_decoder();
-    if (ret < 0)
-    {
-        return ret;
-    }
-    ret = prepare_audio_encoder();
-    if (ret < 0)
-    {
-        return ret;
-    }
-    ret = prepare_audio_resampler();
-    if (ret < 0)
-    {
-        return ret;
-    }
-    ret = readMiddleFrame();
+
+    video_stream_codec_context = new VideoStreamCodecContext(allow_copy);
+    video_stream_codec_context->init_decodec(inFmtCtx, inVStream);
+    video_stream_codec_context->init_encodec(outFmtCtx, outVStream);
+
+    audio_stream_codec_context = new AudioStreamCodecContext();
+    audio_stream_codec_context->init_decodec(inFmtCtx, inAStream);
+    audio_stream_codec_context->init_encodec(outFmtCtx, outAStream);
+
+    check(avformat_write_header(outFmtCtx, NULL));
+    av_dump_format(outFmtCtx, 0, outFileName, 1);
+
+    std::thread read_pkt_t(read_pkt_process_, (void *)this);
+    std::thread process_video_pkt(video_pkt_process_, (void *)this);
+    std::thread process_audio_pkt(audio_pkt_process_, (void *)this);
+    std::thread process_wirte(write_file_process_, (void *)this);
+
+    sleep(20);
+
+    stop = true;
+
+    read_pkt_t.join();
+    v_pkt_process_cond->notify_all();
+    a_pkt_process_cond->notify_all();
+    process_video_pkt.join();
+    process_audio_pkt.join();
+    write_pkt_cond->notify_all();
+    process_wirte.join();
+
+    av_write_trailer(outFmtCtx);
+
     return 1;
 }
 
 int RTSPRecord::openInput()
 {
     int ret = -1;
-    ret = avformat_open_input(&inFmtCtx, inFileName, NULL, NULL);
+    av_dict_set(&open_options, "rtsp_transport", "tcp", 0);
+    ret = check(avformat_open_input(&inFmtCtx, inFileName, NULL, &open_options));
     if (ret < 0)
     {
         fprintf(stderr, "cannot open input stream\n");
         return ret;
     }
 
-    ret = avformat_find_stream_info(inFmtCtx, NULL);
+    ret = check(avformat_find_stream_info(inFmtCtx, NULL));
     if (ret < 0)
     {
         fprintf(stderr, "cannot find streams\n");
@@ -101,9 +487,6 @@ int RTSPRecord::openInput()
     inVStream = inFmtCtx->streams[inVStreamIndex];
     inAStream = inFmtCtx->streams[inAStreamIndex];
 
-    vH = inVStream->codecpar->height;
-    vW = inVStream->codecpar->width;
-
     return 1;
 }
 
@@ -131,396 +514,201 @@ int RTSPRecord::openOutput()
         fprintf(stderr, "new stream err\n");
         return -1;
     }
-    outVStream->time_base = inVStream->time_base;
+    // outVStream->time_base = inVStream->time_base;
     outVStreamIndex = outVStream->index;
 
-    outAStream->time_base = inAStream->time_base;
+    // outAStream->time_base = inAStream->time_base;
     outAStreamIndex = outAStream->index;
 
-    avcodec_parameters_copy(outAStream->codecpar, inAStream->codecpar);
+    // avcodec_parameters_copy(outAStream->codecpar, inAStream->codecpar);
 
     return 1;
 }
 
-int RTSPRecord::prepare_video_decoder()
+void RTSPRecord::read_pkt_process()
 {
-    int ret = -1;
-    vDecoder = avcodec_find_decoder(inVStream->codecpar->codec_id);
-    if (vDecoder == NULL)
+    while (!stop)
     {
-        fprintf(stderr, "not found decoder\n");
-        return -1;
-    }
-    vDecoderCtx = avcodec_alloc_context3(vDecoder);
-    if (vDecoderCtx == NULL)
-    {
-        fprintf(stderr, "failue to alloc decoder context\n");
-        return -1;
-    }
+        AVPacket *pkt = av_packet_alloc();
+        int ret = check(av_read_frame(inFmtCtx, pkt));
 
-    ret = avcodec_parameters_to_context(vDecoderCtx, inVStream->codecpar);
-    if (ret < 0)
-    {
-        fprintf(stderr, "failue to avcodec_parameters_to_context context\n");
-        return ret;
-    }
-
-    ret = avcodec_open2(vDecoderCtx, vDecoder, NULL);
-    if (ret < 0)
-    {
-        fprintf(stderr, "failue to open vDecoder\n");
-        return ret;
-    }
-
-    // av_new_packet(inPkt, vW * vH);
-
-    imgSwsCtx = sws_getContext(
-        vW, vH, vDecoderCtx->pix_fmt,
-        vW, vH, videoPixFormat, SWS_BICUBIC,
-        NULL, NULL, NULL);
-    videoMiddleFrame->width = vW;
-    videoMiddleFrame->height = vH;
-    videoMiddleFrame->format = videoPixFormat;
-    av_image_alloc(videoMiddleFrame->data, videoMiddleFrame->linesize,
-                   vW, vH, videoPixFormat, 1);
-
-    outVStream->time_base = vDecoderCtx->time_base;
-    return 1;
-}
-
-int RTSPRecord::prepare_video_encoder()
-{
-    int ret = -1;
-
-    vEncoder = avcodec_find_encoder(videoEncoderID);
-    AVCodecParameters *outCodecPara = outVStream->codecpar;
-
-    avcodec_parameters_copy(outCodecPara, inVStream->codecpar);
-    outCodecPara->codec_id = videoEncoderID;
-    outCodecPara->format = videoPixFormat;
-    outCodecPara->height = vH;
-    outCodecPara->width = vW;
-    outCodecPara->codec_tag = MKTAG('a', 'v', 'c', '1');
-
-    vEncoderCtx = avcodec_alloc_context3(vEncoder);
-    ret = avcodec_parameters_to_context(vEncoderCtx, outCodecPara);
-    if (ret < 0)
-    {
-        fprintf(stderr, "avcodec_parameters_to_context\n");
-        return ret;
-    }
-    vEncoderCtx->time_base = inVStream->time_base;
-    vEncoderCtx->time_base.num = 1;
-    vEncoderCtx->time_base.den = 25;
-    vEncoderCtx->bit_rate = 400000;
-    vEncoderCtx->gop_size = 12;
-    vEncoderCtx->qmin = 10;
-    vEncoderCtx->qmax = 51;
-    vEncoderCtx->qcompress = (float)0.6;
-
-    ret = avcodec_open2(vEncoderCtx, vEncoder, NULL);
-    if (ret < 0)
-    {
-        fprintf(stderr, "opn vencodr err\n");
-        return ret;
-    }
-
-    avcodec_parameters_from_context(outVStream->codecpar, vEncoderCtx);
-    // av_new_packet(vOutPkt, vH * vW);
-
-    return 1;
-}
-
-int RTSPRecord::prepare_audio_decoder()
-{
-    int ret = -1;
-    aDecoder = avcodec_find_decoder(inAStream->codecpar->codec_id);
-    if (!aDecoder)
-    {
-        fprintf(stderr, "not found audio decoder/n");
-        return -1;
-    }
-
-    aDecoderCtx = avcodec_alloc_context3(aDecoder);
-    if (!aDecoderCtx)
-    {
-        fprintf(stderr, "alloc audio decoder context err/n");
-        return -1;
-    }
-
-    ret = avcodec_parameters_to_context(aDecoderCtx, inAStream->codecpar);
-    if (ret < 0)
-    {
-        fprintf(stderr, "err avcodec_parameters_to_context audio decoder\n");
-        return ret;
-    }
-
-    ret = avcodec_open2(aDecoderCtx, aDecoder, NULL);
-    if (ret < 0)
-    {
-        fprintf(stderr, "open audio decoder err\n");
-        return ret;
-    }
-
-    outAStream->time_base = aDecoderCtx->time_base;
-    return 1;
-}
-
-int RTSPRecord::prepare_audio_resampler()
-{
-    int ret = -1;
-    audioSwrCtx = swr_alloc_set_opts(
-        NULL,
-        av_get_default_channel_layout(aEncoderCtx->channels),
-        aEncoderCtx->sample_fmt,
-        aEncoderCtx->sample_rate,
-        av_get_default_channel_layout(aDecoderCtx->channels),
-        aDecoderCtx->sample_fmt,
-        aDecoderCtx->sample_rate,
-        0, NULL);
-    if (!audioSwrCtx)
-    {
-        fprintf(stderr, "allocat audion swr context err\n");
-        return AVERROR(ENOMEM);
-    }
-
-    ret = swr_init(audioSwrCtx);
-    if (ret < 0)
-    {
-        fprintf(stderr, "init audio swr err\n");
-        return ret;
-    }
-    audioMiddleFrame->channel_layout = av_get_default_channel_layout(aEncoderCtx->channels);
-    audioMiddleFrame->channels = aEncoderCtx->channels;
-    audioMiddleFrame->sample_rate = aEncoderCtx->sample_rate;
-    audioMiddleFrame->format = aEncoderCtx->sample_fmt;
-    audioMiddleFrame->nb_samples = aEncoderCtx->frame_size;
-    av_frame_get_buffer(audioMiddleFrame, 0);
-    audioMiddleFrame->linesize[1] = audioMiddleFrame->linesize[1];
-
-    audioInFrame->channel_layout = av_get_default_channel_layout(aEncoderCtx->channels);
-    audioInFrame->format = aEncoderCtx->sample_fmt;
-    audioInFrame->sample_rate = aEncoderCtx->sample_rate;
-
-    audioFifo = av_audio_fifo_alloc(aEncoderCtx->sample_fmt, aEncoderCtx->channels, 1);
-    if (!audioFifo)
-    {
-        fprintf(stderr, "alloc audi fifo err\n");
-        return -1;
-    }
-    return 0;
-}
-
-int RTSPRecord::prepare_audio_encoder()
-{
-    int ret = -1;
-
-    aEncoder = avcodec_find_encoder(audioEncoderID);
-    if (!aEncoder)
-    {
-        fprintf(stderr, "not find audio encoder\n");
-        return -1;
-    }
-    aEncoderCtx = avcodec_alloc_context3(aEncoder);
-    aEncoderCtx->channels = inAStream->codecpar->channels;
-    aEncoderCtx->channel_layout = av_get_default_channel_layout(aEncoderCtx->channels);
-    aEncoderCtx->sample_rate = aDecoderCtx->sample_rate;
-    aEncoderCtx->sample_fmt = aEncoder->sample_fmts[0];
-    aEncoderCtx->bit_rate = aDecoderCtx->bit_rate;
-
-    // AVCodecParameters *outCodecPara = outAStream->codecpar;
-    // avcodec_parameters_copy(outCodecPara, inAStream->codecpar);
-    // outCodecPara->codec_id = audioEncoderID;
-    // outCodecPara->channels = inAStream->codecpar->channels;
-    // outCodecPara->channel_layout = av_get_default_channel_layout(outCodecPara->channels);
-    // outCodecPara->format = AV_SAMPLE_FMT_FLTP;
-    // ret = avcodec_parameters_to_context(aEncoderCtx, outCodecPara);
-    // if (ret < 0)
-    // {
-    //     fprintf(stderr, "err audio encoder avcodec_parameters_to_context");
-    //     return ret;
-    // }
-    if (outFmtCtx->oformat->flags & AVFMT_GLOBALHEADER)
-    {
-        aEncoderCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    }
-
-    ret = avcodec_open2(aEncoderCtx, aEncoder, NULL);
-    if (ret < 0)
-    {
-        fprintf(stderr, "err to open audio encoder\n");
-        return ret;
-    }
-    avcodec_parameters_from_context(outAStream->codecpar, aEncoderCtx);
-    return 1;
-}
-
-int RTSPRecord::readMiddleFrame()
-{
-    av_dump_format(outFmtCtx, 0, outFileName, 1);
-
-    int ret = -1;
-    ret = avformat_write_header(outFmtCtx, NULL);
-    if (ret < 0)
-    {
-        fprintf(stderr, "err write header\n");
-        return ret;
-    }
-
-    int videoFrameIndex = 0;
-    int audioFramIndex = 0;
-    while (av_read_frame(inFmtCtx, inPkt) >= 0)
-    {
-        if (inPkt->stream_index == inVStreamIndex)
+        if (ret >= 0)
         {
-            if (avcodec_send_packet(vDecoderCtx, inPkt) == 0)
+            if (pkt->stream_index == inVStreamIndex)
             {
-                while (avcodec_receive_frame(vDecoderCtx, videoInFrame) == 0)
-                {
-                    int ret = sws_scale(imgSwsCtx, videoInFrame->data, videoInFrame->linesize, 0, vH, videoMiddleFrame->data, videoMiddleFrame->linesize);
-
-                    videoMiddleFrame->pkt_duration = videoInFrame->pkt_duration;
-
-                    videoMiddleFrame->pts = videoInFrame->pts;
-                    videoMiddleFrame->pkt_dts = videoInFrame->pkt_dts;
-                    videoMiddleFrame->pkt_pts = videoInFrame->pkt_pts;
-                    videoMiddleFrame->pkt_pos = inPkt->pos;
-                    // printf("fram %d result %d duration %d pts %d dts %d\n", videoFrameIndex, ret, videoMiddleFrame->pkt_duration, videoMiddleFrame->pkt_dts, videoMiddleFrame->pkt_pts);
-
-                    ret = avcodec_send_frame(vEncoderCtx, videoMiddleFrame);
-                    if (ret < 0)
-                    {
-                        fprintf(stderr, "frame %d send err\n", videoFrameIndex);
-                        continue;
-                    }
-                    vOutPkt = av_packet_alloc();
-                    ret = avcodec_receive_packet(vEncoderCtx, vOutPkt);
-                    if (ret >= 0)
-                    {
-                        // printf("video out packet %d duration %d pts %d dts %d pos %d\n", videoFrameIndex, vOutPkt->duration, vOutPkt->dts, vOutPkt->pts, vOutPkt->pos);
-                        vOutPkt->stream_index = outVStreamIndex;
-                        videoPktStack.push(vOutPkt);
-                        // tempPkt = &videoPktStack.top();
-                        write_to_file();
-
-                        // if (videoFrameIndex > 50)
-                        // {
-                        //     av_write_trailer(outFmtCtx);
-                        //     return 1;
-                        // }
-                    }
-                    // av_packet_unref(vOutPkt);
-
-                    videoFrameIndex++;
-                }
+                v_input_pkt_queue->push(pkt);
+                v_pkt_process_cond->notify_all();
             }
+            else if (pkt->stream_index == inAStreamIndex)
+            {
+                a_input_pkt_queue->push(pkt);
+                a_pkt_process_cond->notify_all();
+            }
+            // cond->notify_all();
         }
-        else if (inPkt->stream_index == inAStreamIndex)
+        else
         {
-            if (avcodec_send_packet(aDecoderCtx, inPkt) == 0)
-            {
-                while (avcodec_receive_frame(aDecoderCtx, audioInFrame) >= 0)
-                {
-                    uint8_t **converted_input_samples = NULL;
-                    converted_input_samples = (uint8_t **)calloc(aEncoderCtx->channels, sizeof(*converted_input_samples));
-
-                    av_samples_alloc(converted_input_samples, NULL, aEncoderCtx->channels, aEncoderCtx->frame_size, aEncoderCtx->sample_fmt, 0);
-                    swr_convert(audioSwrCtx, converted_input_samples, audioMiddleFrame->nb_samples, (const uint8_t **)audioInFrame->data, audioInFrame->nb_samples);
-
-                    int length = aEncoderCtx->frame_size * av_get_bytes_per_sample(aEncoderCtx->sample_fmt);
-
-                    // memcpy(audioInFrame->data[0], converted_input_samples[0], length);
-                    audioMiddleFrame->data[0] = converted_input_samples[0];
-                    audioMiddleFrame->data[1] = converted_input_samples[1];
-                    // audioMiddleFrame->linesize[0] = audioMiddleFrame->nb_samples;
-                    audioMiddleFrame->pts = audioInFrame->pts;
-                    audioMiddleFrame->pkt_dts = audioInFrame->pkt_dts;
-                    audioMiddleFrame->pkt_pts = audioInFrame->pkt_pts;
-                    audioMiddleFrame->pkt_pos = audioInFrame->pkt_pos;
-                    // (uint8_t *)audioMiddleFrame->data = converted_input_samples;
-
-                    ret = avcodec_send_frame(aEncoderCtx, audioMiddleFrame);
-                    if (ret < 0)
-                    {
-                        fprintf(stderr, "audio frame %d send err\n", audioFramIndex);
-                        continue;
-                    }
-                    aOutPkt = av_packet_alloc();
-                    ret = avcodec_receive_packet(aEncoderCtx, aOutPkt);
-
-                    if (ret >= 0)
-                    {
-                        aOutPkt->stream_index = outAStreamIndex;
-
-                        // printf("audio out packet %d duration %d pts %d dts %d pos %d\n", audioFramIndex, aOutPkt->duration, aOutPkt->dts, aOutPkt->pts, aOutPkt->pos);
-                        audioPktStack.push(aOutPkt);
-                        write_to_file();
-                    }
-                    if (audioFramIndex > 500)
-                    {
-                        av_write_trailer(outFmtCtx);
-                        return 1;
-                    }
-                    audioFramIndex++;
-                }
-                // av_packet_unref(aOutPkt);
-            }
-            av_packet_unref(inPkt);
+            av_packet_free(&pkt);
         }
+    }
+    v_input_pkt_queue->push(NULL);
+    a_input_pkt_queue->push(NULL);
+}
+
+void RTSPRecord::video_pkt_process()
+{
+    AVPacket *pkt;
+    while (!v_input_pkt_queue->empty())
+    {
+        pkt = v_input_pkt_queue->front();
+        v_input_pkt_queue->pop();
+        video_stream_codec_context->decode_pkt(pkt, video_pkt_queue);
+    }
+}
+
+void RTSPRecord::audio_pkt_process()
+{
+    AVPacket *pkt;
+    while (!a_input_pkt_queue->empty())
+    {
+        pkt = a_input_pkt_queue->front();
+        a_input_pkt_queue->pop();
+        audio_stream_codec_context->decode_pkt(pkt, audio_pkt_queue);
+    }
+}
+
+void RTSPRecord::write_file_process()
+{
+
+    while (!this->video_pkt_queue->empty() || !this->audio_pkt_queue->empty())
+    {
+        write_to_file();
     }
 }
 
 int RTSPRecord::write_to_file()
 {
     AVPacket *tempPkt;
-    // 初始化，先同步
-    if (nextPts == -1)
+    float ts = 0;
+
+    int last_scrap_v_pts = -1, last_scrap_a_pts = -1;
+
+    // 进行对齐
+
+    while (key_v_pts < 0 && !video_pkt_queue->empty())
     {
-        if (videoPktStack.empty() || audioPktStack.empty())
+        tempPkt = video_pkt_queue->front();
+        // ts = tempPkt->pts * av_q2d(outVStream->time_base);
+
+        if (tempPkt->flags & AV_PKT_FLAG_KEY)
         {
-            return 1;
+            key_v_pts = tempPkt->pts;
+            key_a_pts = av_rescale_q(key_v_pts, outVStream->time_base, outAStream->time_base);
         }
-
-        int videoPts = videoPktStack.front()->pts;
-        int audioPts = audioPktStack.front()->pts;
-
-        nextPts = (videoPts > audioPts) ? videoPts : audioPts;
-
-        // 清空队列
-        while (!videoPktStack.empty() && videoPktStack.front()->pts < nextPts)
+        else
         {
-            tempPkt = videoPktStack.front();
+            last_scrap_v_pts = tempPkt->pts;
+            last_scrap_a_pts = av_rescale_q(last_scrap_v_pts, outVStream->time_base, outAStream->time_base);
             av_packet_free(&tempPkt);
-            videoPktStack.pop();
+            video_pkt_queue->pop();
         }
-        while (!audioPktStack.empty() && audioPktStack.front()->pts < nextPts)
+    }
+
+    while (key_v_pts < 0 && !audio_pkt_queue->empty())
+    {
+        tempPkt = audio_pkt_queue->front();
+        if (tempPkt->pts < last_scrap_a_pts)
         {
-            tempPkt = audioPktStack.front();
             av_packet_free(&tempPkt);
-            audioPktStack.pop();
+            audio_pkt_queue->pop();
+        }
+        else
+        {
+            break;
         }
     }
 
-    if (!(videoPktStack.empty() || audioPktStack.empty()))
+    while (key_v_pts >= 0 && !video_pkt_queue->empty())
     {
-        nextPts += AV_TIME_BASE;
+        tempPkt = video_pkt_queue->front();
+        tempPkt->pts -= key_v_pts;
+        tempPkt->dts -= key_v_pts;
+
+        ts = tempPkt->pts * av_q2d(outVStream->time_base);
+        printf("video stream %d pts %d time %.2f flags %d\n", tempPkt->stream_index, tempPkt->pts, ts, tempPkt->flags);
+
+        check(av_interleaved_write_frame(outFmtCtx, tempPkt));
+        av_packet_free(&tempPkt);
+        video_pkt_queue->pop();
     }
 
-    while (!videoPktStack.empty() && videoPktStack.front()->pts <= nextPts)
+    while (key_v_pts >= 0 && !audio_pkt_queue->empty())
     {
-        tempPkt = videoPktStack.front();
-        printf("video write pts %d\n", tempPkt->pts);
-        // av_interleaved_write_frame(outFmtCtx, tempPkt);
+        tempPkt = audio_pkt_queue->front();
+        if (tempPkt->pts >= key_a_pts)
+        {
+            tempPkt->pts -= key_a_pts;
+            tempPkt->dts -= key_a_pts;
+
+            ts = tempPkt->pts * av_q2d(outAStream->time_base);
+            printf("audio write pts %d time %.2f stream %d \n", tempPkt->pts, ts, tempPkt->stream_index);
+            av_interleaved_write_frame(outFmtCtx, tempPkt);
+        }
         av_packet_free(&tempPkt);
-        videoPktStack.pop();
-    }
-    while (!audioPktStack.empty() && audioPktStack.front()->pts <= nextPts)
-    {
-        tempPkt = audioPktStack.front();
-        printf("audio write pts %d\n", tempPkt->pts);
-        av_interleaved_write_frame(outFmtCtx, tempPkt);
-        av_packet_free(&tempPkt);
-        audioPktStack.pop();
+
+        audio_pkt_queue->pop();
     }
     return 0;
+}
+
+void RTSPRecord::read_pkt_process_(void *param)
+{
+    RTSPRecord *p = (RTSPRecord *)param;
+    p->read_pkt_process();
+}
+
+void RTSPRecord::video_pkt_process_(void *param)
+{
+    RTSPRecord *p = (RTSPRecord *)param;
+    while (!p->stop)
+    {
+        std::mutex temp_mutex;
+        std::unique_lock<std::mutex> temp_lock(temp_mutex);
+        p->v_pkt_process_cond->wait(temp_lock, [p]
+                                    { return !p->v_input_pkt_queue->empty() || p->stop; });
+        temp_lock.unlock();
+        p->video_pkt_process();
+        p->write_pkt_cond->notify_all();
+    }
+}
+
+void RTSPRecord::audio_pkt_process_(void *param)
+{
+    RTSPRecord *p = (RTSPRecord *)param;
+
+    while (!p->stop)
+    {
+        std::mutex temp_mutex;
+        std::unique_lock<std::mutex> temp_lock(temp_mutex);
+        p->a_pkt_process_cond->wait(temp_lock, [p]
+                                    { return !p->a_input_pkt_queue->empty() || p->stop; });
+        temp_lock.unlock();
+        p->audio_pkt_process();
+        p->write_pkt_cond->notify_all();
+    }
+}
+
+void RTSPRecord::write_file_process_(void *param)
+{
+    RTSPRecord *p = (RTSPRecord *)param;
+
+    while (!p->stop)
+    {
+        std::mutex temp_mutex;
+        std::unique_lock<std::mutex> temp_lock(temp_mutex);
+        p->write_pkt_cond->wait(temp_lock, [p]
+                                { return !p->video_pkt_queue->empty() || !p->audio_pkt_queue->empty() || p->stop; });
+        temp_lock.unlock();
+        p->write_file_process();
+    }
 }

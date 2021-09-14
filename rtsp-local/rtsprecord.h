@@ -7,6 +7,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <unistd.h>
+#include <chrono>
+#include <future>
 
 extern "C"
 {
@@ -23,17 +25,17 @@ class StreamCodecContext
 public:
     StreamCodecContext();
     ~StreamCodecContext();
-    AVStream *in_stream, *out_stream;
+    AVStream *in_stream = NULL, *out_stream = NULL;
 
     AVDictionary *enc_options = NULL;
 
-    AVCodecContext *dec_ctx;
-    AVCodecContext *enc_ctx;
+    AVCodecContext *dec_ctx = NULL;
+    AVCodecContext *enc_ctx = NULL;
 
-    AVPacket *out_pkt;
+    AVPacket *out_pkt = NULL;
 
-    AVFrame *dec_frame;
-    AVFrame *enc_frame;
+    AVFrame *dec_frame = NULL;
+    AVFrame *enc_frame = NULL;
 
     int init_decodec(AVFormatContext *in_fmt_ctx, AVStream *in_stream);
     int init_encodec(AVFormatContext *out_fmt_ctx, AVStream *out_stream);
@@ -64,8 +66,8 @@ private:
 class AudioStreamCodecContext : public StreamCodecContext
 {
 public:
-    struct SwrContext *swr_ctx;
-    AVAudioFifo *smaple_fifo;
+    struct SwrContext *swr_ctx = NULL;
+    AVAudioFifo *smaple_fifo = NULL;
 
     AudioStreamCodecContext();
     ~AudioStreamCodecContext();
@@ -81,15 +83,19 @@ private:
 class RTSPRecord
 {
 public:
-    RTSPRecord(const char *inFileName, const char *outFileName);
+    RTSPRecord(const char *inFileName);
     ~RTSPRecord();
-    int start();
+    int reopen_ouput(const char *output_filename);
+    int open_input();
+    int open_output(const char *out_fileName);
+    int start_record(int duration);
+    int stop_record();
 
 private:
     const char *inFileName = "";
-    const char *outFileName = "/root/study_c/.temp/record.mp4";
+    const char *out_fileName = "/root/study_c/.temp/record.mp4";
     const int MAX_PKT_QUEUE = 100;
-    AVFormatContext *inFmtCtx, *outFmtCtx = NULL;
+    AVFormatContext *inFmtCtx = NULL, *outFmtCtx = NULL;
 
     AVDictionary *open_options = NULL;
 
@@ -98,15 +104,14 @@ private:
     int inVStreamIndex, inAStreamIndex = -1;
     int outVStreamIndex, outAStreamIndex = -1;
 
-    PacketQueue *v_input_pkt_queue, *a_input_pkt_queue;
-    PacketQueue *video_pkt_queue, *audio_pkt_queue;
-    std::condition_variable *write_pkt_cond, *v_pkt_process_cond, *a_pkt_process_cond;
+    PacketQueue *v_input_pkt_queue = NULL, *a_input_pkt_queue = NULL;
+    PacketQueue *video_pkt_queue = NULL, *audio_pkt_queue = NULL;
+    std::condition_variable *write_pkt_cond = NULL, *v_pkt_process_cond = NULL;
+    std::condition_variable *a_pkt_process_cond = NULL, *record_cond;
 
-    VideoStreamCodecContext *video_stream_codec_context;
-    AudioStreamCodecContext *audio_stream_codec_context;
+    VideoStreamCodecContext *video_stream_codec_context = NULL;
+    AudioStreamCodecContext *audio_stream_codec_context = NULL;
 
-    int openInput();
-    int openOutput();
     void read_pkt_process();
     static void read_pkt_process_(void *param);
     void video_pkt_process();
@@ -117,10 +122,13 @@ private:
     void write_file_process();
     static void write_file_process_(void *param);
 
+    std::thread *read_pkt_t = NULL, *process_video_pkt_t = NULL, *process_audio_pkt_t = NULL, *process_wirte_t = NULL;
+
     float output_video_ts = 0;
     int key_v_pts = -1, key_a_pts = -1;
+    bool stop_tag = false;
+    int read_pkt_result;
 
-    bool stop = false;
-    bool allow_copy = true;
+    bool allow_copy = false;
 };
 #endif

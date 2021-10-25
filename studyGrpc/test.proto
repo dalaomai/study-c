@@ -1,0 +1,15 @@
+syntax="proto3";
+
+message Input{
+    int32 a=1;
+}
+
+message OutPut{
+    int32 b=1;
+}
+
+service TestRoute{
+    rpc GetTest(Input) returns (OutPut){}
+
+    rpc GetStreamTest(stream Input)returns(stream OutPut){}
+}
